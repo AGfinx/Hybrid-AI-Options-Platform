@@ -1,46 +1,122 @@
-# Hybrid AI Options Platform Documentation
+# Hybrid AI Options Platform
 
-This directory contains the product, business, functional, technical, architecture, API, operations, and developer documentation for the hybrid human-in-the-loop cryptocurrency-options platform.
+A human-in-the-loop cryptocurrency options analytics, risk-management, recommendation, and paper-trading platform.
 
-## Documentation map
+## System Overview
 
-| Document | Purpose | Primary audience |
-|---|---|---|
-| [BRD](BRD.md) | Business goals, users, scope, value, and business success measures | Business owners, product leadership, risk owners |
-| [PRD](PRD.md) | Product vision, features, user stories, modes, and product success criteria | Product, design, engineering, users |
-| [FRD](FRD.md) | Testable functional requirements and system behaviors | Engineering, QA, product |
-| [TDD](TDD.md) | Detailed technical design, services, data entities, reliability, security, and testing | Developers, architects, SRE |
-| [System Architecture](ARCHITECTURE.md) | High-level components, data flow, integrations, deployment, and security boundaries | Architects, engineering leadership |
-| [RFC-001](RFC-001-technology-stack.md) | Proposed technology stack and staged architecture decision | Engineering team, reviewers |
-| [API Reference](API.md) | Versioned API conventions, endpoints, payloads, response codes, and safety rules | Backend and frontend developers, integrators |
-| [Runbook](RUNBOOK.md) | Deployment, monitoring, incident response, restart, rollback, and emergency procedures | SRE, operations, on-call engineers |
+The Hybrid AI Options Platform enforces a strict **Recommendation Mode** by default. Live order routing and production exchange trading credentials remain **strictly disabled**.
 
-## Recommended reading order
+Key platform capabilities:
+- **Public Market Data Ingestion**: WebSocket & JSON-RPC public feed adapter for Deribit cryptocurrency options.
+- **Deterministic Offline Replay**: Embedded DuckDB & Parquet event replay engine with 11,200 synthetic BTC ticks.
+- **Quantitative Analytics (`packages/quant`)**:
+  - Analytical Black-Scholes-Merton pricer & Greeks (Delta, Gamma, Vega, Theta, Rho).
+  - Brent-solver implied volatility inversion.
+  - Bilinear / Parametric volatility surface interpolation with calendar and butterfly non-arbitrage bounds.
+  - Time-aware Realized Volatility forecaster with walk-forward cross-validation and uncertainty bands.
+  - Transparent opportunity calculation with spread, fee, slippage, hedge cost, and uncertainty penalties.
+- **Independent Risk Engine (`packages/risk`)**:
+  - Isolated risk gatekeeper enforcing capital, margin, Greek limits, and data freshness.
+  - 7x7 non-linear stress scenario matrix evaluating joint spot shocks (±20%) and volatility shocks (±15%).
+  - Immediate fail-closed Emergency Stop circuit breaker.
+- **Deterministic Paper Simulator (`services/simulator`)**:
+  - Realistic order execution with spread crossing, exchange fee schedules (3 bps), dynamic slippage, and automated spot delta-hedging.
+  - Real-time P&L factor attribution (Delta, Gamma, Vega, Theta, Fees, Slippage, Hedge, Residual).
+- **Interactive Web Cockpit (`apps/web`)**:
+  - Next.js 14 dashboard UI with operating mode toggles, interactive parameter adjustment modal, real-time recalculation of risk, and compliance audit trail.
 
-1. Read the BRD to understand business value, scope, target users, and financial impact.
-2. Read the PRD to understand product capabilities and the hybrid operating model.
-3. Read the FRD to understand testable behaviors.
-4. Read the architecture and TDD to understand implementation boundaries.
-5. Read RFC-001 to review technology choices and deferred complexity.
-6. Read the API reference when implementing services or integrations.
-7. Read the runbook before deploying or operating any environment.
+---
 
-## Operating principle
+## Monorepo Layout
 
-The platform may automate analysis broadly, recommendations selectively, execution narrowly, and risk reduction decisively. The user controls the authority granted to each strategy.
+```text
+TSProject/
+├── apps/
+│   └── web/                 # Next.js 14 dashboard UI (React, TypeScript, CSS, Lucide icons)
+├── services/
+│   ├── api/                 # FastAPI REST server implementing API.md spec
+│   ├── market_data/         # Public Deribit WebSocket/HTTP ingestion and normalizer
+│   ├── replay/              # Deterministic market event replay engine (DuckDB/Parquet)
+│   └── simulator/           # Paper trading order execution and fill simulator
+├── packages/
+│   ├── quant/               # Black-Scholes pricing, IV surface, RV forecast, net edge calculation
+│   └── risk/                # Independent risk engine, limits, stress scenario grid, circuit breakers
+├── db/
+│   ├── models/              # SQLAlchemy database ORM schemas (24 domain entities)
+│   ├── database.py          # PostgreSQL/SQLite database manager & session lifecycle
+│   └── seed.py              # Seed script for default user, instruments, and risk limits
+├── data/
+│   └── samples/             # Synthetic BTC options parquet data slice
+├── docs/
+│   ├── IMPLEMENTATION_PLAN.md
+│   └── DECISIONS.md
+├── tests/
+│   ├── unit/                # Math, risk invariants, domain entity unit tests
+│   ├── integration/         # API endpoint and database integration tests
+│   └── replay/              # Replay & paper trading simulator tests
+├── infra/
+│   ├── docker-compose.yml   # Multi-container stack (PostgreSQL, Redis, API, Web)
+│   └── Dockerfile.api       # FastAPI Docker container specification
+├── Makefile
+├── pytest.ini
+└── .env.example
+```
 
-## Environment policy
+---
 
-Development, research, paper, test, shadow, and production-candidate environments must be separated. Production order-entry capability must remain disabled until quantitative validation, security review, operational testing, compliance review, and explicit approval are complete.
+## Quickstart & Local Setup
 
-## Local documentation preview
+### 1. Prerequisites
+- Python 3.11+
+- Node.js 18+ and npm
+- (Optional) Docker & Docker Compose
 
-These files are standard Markdown and can be viewed in any Git repository or Markdown editor. For a local preview, use any Markdown-capable editor or static documentation generator.
+### 2. Backend Setup
+```bash
+# Activate virtual environment
+.\.venv\Scripts\activate
 
-## Contribution rules
+# Install dependencies (if not already installed)
+pip install -r requirements.txt
 
-Changes to requirements, APIs, risk limits, data schemas, model contracts, or operating modes require a document update and review. Code changes that affect a documented contract must update the relevant document in the same change.
+# Seed the database with 24 domain entities and synthetic BTC instruments
+python -m db.seed
 
-## Versioning
+# Run the complete test suite (100% offline, 24/24 passing)
+pytest tests/ -v
 
-Each document should acquire a version, owner, status, and last-reviewed date when adopted into a repository. The current documents are a coherent initial baseline derived from the platform concept and hybrid workflow.
+# Start the FastAPI core server on port 8000
+python -m uvicorn services.api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Interactive OpenAPI docs will be available at [http://localhost:8000/docs](http://localhost:8000/docs).
+
+### 3. Frontend Dashboard Setup
+```bash
+cd apps/web
+
+# Start Next.js development server on port 3000
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000) in your browser.
+
+---
+
+## Operating Modes
+
+1. **`recommendation` (Default)**:
+   Algorithmic opportunities are surfaced in the queue with transparent cost breakdowns and risk limits. Orders require explicit human approval and parameter review.
+2. **`analytics`**:
+   Market data, implied volatility surfaces, and risk metrics are computed and displayed; trade recommendations and order entries are disabled.
+3. **`assisted`**:
+   Allows guided execution within approved strategy mandate boundaries.
+4. **`bounded_automation`**:
+   Paper simulation only. Live execution remains strictly blocked by system circuit breakers.
+
+---
+
+## Safety Guarantees
+- **No Exchange Credentials**: The platform does not request, store, or accept live API keys or private credentials.
+- **Fail-Closed Gatekeeper**: If market data is stale (>15 seconds), if a circuit breaker is engaged, or if the risk engine rejects an action, new orders are blocked.
+- **Emergency Stop Override**: One-click Emergency Stop halts all paper risk submission and writes an immutable audit record.

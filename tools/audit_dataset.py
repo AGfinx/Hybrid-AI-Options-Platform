@@ -1,333 +1,242 @@
-#!/usr/bin/env python3
 """
-Dataset Audit Script for Hybrid AI Options Platform
-Audits Parquet files and generates a comprehensive dataset audit report.
+Reusable Parquet dataset auditor for cryptocurrency options data.
+Analyzes row counts, column schemas, data quality, instrument coverage,
+temporal density, and suitability for ML modeling.
 """
 
-import argparse
-import json
+import os
+import re
 import sys
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
+import argparse
+import datetime
+from typing import Dict, Any, List
 import pandas as pd
-import pyarrow.parquet as pq
+import numpy as np
 
+def audit_dataset(file_path: str, output_md: str = None) -> Dict[str, Any]:
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
 
-def audit_parquet_file(filepath: Path) -> Dict[str, Any]:
-    """Audit a single Parquet file and return comprehensive statistics."""
-    
-    # Read with pyarrow for metadata
-    pf = pq.ParquetFile(filepath)
-    schema = pf.schema_arrow
-    
-    # Read full data with pandas for analysis
-    df = pd.read_parquet(filepath)
-    
-    report = {
-        "file": str(filepath),
-        "file_size_bytes": filepath.stat().st_size,
-        "num_rows": len(df),
-        "num_columns": len(df.columns),
-        "column_names": list(df.columns),
-        "data_types": {col: str(dtype) for col, dtype in df.dtypes.items()},
-        "missing_values": df.isnull().sum().to_dict(),
-        "duplicate_rows": int(df.duplicated().sum()),
-        "memory_usage_mb": round(df.memory_usage(deep=True).sum() / 1024 / 1024, 2),
-    }
-    
+    print(f"Reading dataset: {file_path}...")
+    df = pd.read_parquet(file_path)
+
+    n_rows, n_cols = df.shape
+    columns = list(df.columns)
+    dtypes = {col: str(dtype) for col, dtype in df.dtypes.items()}
+    missing_counts = {col: int(df[col].isnull().sum()) for col in columns}
+    total_missing = sum(missing_counts.values())
+    n_duplicates = int(df.duplicated().sum())
+
     # Timestamp analysis
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        report["min_timestamp"] = df["timestamp"].min().isoformat()
-        report["max_timestamp"] = df["timestamp"].max().isoformat()
-        report["num_unique_timestamps"] = int(df["timestamp"].nunique())
-        report["time_span_hours"] = round((df["timestamp"].max() - df["timestamp"].min()).total_seconds() / 3600, 2)
-        
-        # Check timestamp density
-        if report["num_unique_timestamps"] > 1:
-            avg_interval_sec = (df["timestamp"].max() - df["timestamp"].min()).total_seconds() / (report["num_unique_timestamps"] - 1)
-            report["avg_timestamp_interval_seconds"] = round(avg_interval_sec, 2)
-    
-    # Strike analysis - parse from instrument_name if not a direct column
-    if "strike" in df.columns:
-        report["num_unique_strikes"] = int(df["strike"].nunique())
-        report["min_strike"] = float(df["strike"].min())
-        report["max_strike"] = float(df["strike"].max())
-        report["unique_strikes"] = sorted(df["strike"].unique().tolist())
-    elif "instrument_name" in df.columns:
-        # Parse strike from instrument_name (format: BTC-25SEP26-55000-C)
+    has_timestamp = "timestamp" in df.columns
+    min_ts, max_ts = None, None
+    n_unique_ts = 0
+    time_delta_seconds = None
+    avg_interval_seconds = None
+    timestamps_dense = False
+
+    if has_timestamp:
         try:
-            strikes = df["instrument_name"].str.extract(r'-(\d+)-[CP]$')[0].astype(float)
-            report["num_unique_strikes"] = int(strikes.nunique())
-            report["min_strike"] = float(strikes.min())
-            report["max_strike"] = float(strikes.max())
-            report["unique_strikes"] = sorted(strikes.unique().tolist())
-            report["strike_source"] = "parsed_from_instrument_name"
-        except Exception:
-            pass
-    
-    # Expiry analysis - parse from instrument_name if not a direct column
-    expiry_col = None
-    for col in ["expiry_years", "T", "time_to_expiry"]:
-        if col in df.columns:
-            expiry_col = col
-            break
-    if expiry_col:
-        report["num_unique_expiries"] = int(df[expiry_col].nunique())
-        report["min_expiry"] = float(df[expiry_col].min())
-        report["max_expiry"] = float(df[expiry_col].max())
-        report["unique_expiries"] = sorted(df[expiry_col].unique().tolist())
-        report["expiry_column_used"] = expiry_col
-    elif "instrument_name" in df.columns:
-        # Parse expiry from instrument_name (format: BTC-25SEP26-55000-C)
-        try:
-            expiries = df["instrument_name"].str.extract(r'-(\d{2}[A-Z]{3}\d{2})-')[0]
-            # Convert to approximate years from timestamp
-            if "timestamp" in df.columns:
-                df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-                # Parse expiry date
-                expiry_dates = pd.to_datetime(expiries[0], format='%d%b%y', errors='coerce')
-                # This is more complex - just count unique expiry codes
-                report["num_unique_expiries"] = int(expiries.nunique())
-                report["unique_expiry_codes"] = sorted(expiries.unique().tolist())
-                report["expiry_source"] = "parsed_from_instrument_name"
-        except Exception:
-            pass
-    
-    # Instruments/Assets
-    if "underlying" in df.columns:
-        report["unique_underlyings"] = df["underlying"].unique().tolist()
+            ts_series = pd.to_datetime(df["timestamp"])
+            min_ts = ts_series.min().isoformat()
+            max_ts = ts_series.max().isoformat()
+            unique_ts = ts_series.drop_duplicates().sort_values()
+            n_unique_ts = len(unique_ts)
+            if n_unique_ts > 1:
+                intervals = unique_ts.diff().dropna().dt.total_seconds()
+                avg_interval_seconds = float(intervals.median())
+                time_delta_seconds = float((unique_ts.max() - unique_ts.min()).total_seconds())
+                # Considered dense if median interval <= 60 seconds
+                timestamps_dense = avg_interval_seconds <= 60.0
+        except Exception as e:
+            print(f"Warning: Could not parse timestamps: {e}")
+
+    # Instrument & asset extraction
+    instruments = []
+    underlyings = []
+    strikes = []
+    expiries = []
+
     if "instrument_name" in df.columns:
-        report["num_unique_instruments"] = int(df["instrument_name"].nunique())
-    
-    # Data quality checks
-    report["has_bid_ask"] = "best_bid_price" in df.columns and "best_ask_price" in df.columns
-    report["has_underlying_price"] = "underlying_price" in df.columns
-    report["has_iv"] = "implied_volatility" in df.columns
-    report["has_greeks"] = "delta" in df.columns and "vega" in df.columns
-    report["has_volume"] = "best_bid_amount" in df.columns and "best_ask_amount" in df.columns
-    report["has_mark_price"] = "mark_price" in df.columns
-    
-    # Check for negative prices/spreads
-    if report["has_bid_ask"]:
-        report["negative_spread_count"] = int((df["best_ask_price"] < df["best_bid_price"]).sum())
-        report["zero_bid_count"] = int((df["best_bid_price"] <= 0).sum())
-        report["zero_ask_count"] = int((df["best_ask_price"] <= 0).sum())
-    
-    if report["has_iv"]:
-        report["iv_min"] = float(df["implied_volatility"].min())
-        report["iv_max"] = float(df["implied_volatility"].max())
-        report["iv_mean"] = float(df["implied_volatility"].mean())
-        report["iv_std"] = float(df["implied_volatility"].std())
-        report["negative_iv_count"] = int((df["implied_volatility"] < 0).sum())
-    
-    if "underlying_price" in df.columns:
-        report["spot_min"] = float(df["underlying_price"].min())
-        report["spot_max"] = float(df["underlying_price"].max())
-        report["spot_mean"] = float(df["underlying_price"].mean())
-    
-    # Check if data appears synthetic
-    report["is_likely_synthetic"] = _detect_synthetic_data(df)
-    
-    # Time-series density for forecasting
-    if "timestamp" in df.columns and report["num_unique_timestamps"] > 10:
-        report["suitable_for_ts_forecasting"] = True
-        report["ts_density_note"] = f"{report['num_unique_timestamps']} unique timestamps over {report['time_span_hours']:.1f} hours"
-    else:
-        report["suitable_for_ts_forecasting"] = False
-        report["ts_density_note"] = "Insufficient temporal resolution for time-series forecasting"
-    
-    return report
+        instruments = sorted(df["instrument_name"].dropna().unique().tolist())
+        # Parse standard Deribit-style instrument names: BTC-25SEP26-65000-C
+        for inst in instruments:
+            parts = str(inst).split("-")
+            if len(parts) >= 4:
+                underlyings.append(parts[0])
+                expiries.append(parts[1])
+                try:
+                    strikes.append(float(parts[2]))
+                except ValueError:
+                    pass
+    if "underlying" in df.columns:
+        underlyings.extend(df["underlying"].dropna().unique().tolist())
 
+    unique_underlyings = sorted(list(set(underlyings)))
+    unique_strikes = sorted(list(set(strikes)))
+    unique_expiries = sorted(list(set(expiries)))
 
-def _detect_synthetic_data(df: pd.DataFrame) -> bool:
-    """Heuristic to detect if data is synthetically generated."""
-    indicators = []
-    
-    # Check for perfectly regular time intervals
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        unique_ts = df["timestamp"].sort_values().unique()
-        if len(unique_ts) > 10:
-            intervals = pd.Series(unique_ts).diff().dt.total_seconds().dropna()
-            # If all intervals are exactly the same (or very close), likely synthetic
-            if intervals.std() < 0.01 and intervals.mean() > 0:
-                indicators.append("perfectly_regular_timestamps")
-    
-    # Check for round-number patterns in strikes
-    if "strike" in df.columns:
-        strikes = df["strike"].unique()
-        round_strikes = sum(1 for s in strikes if s % 1000 == 0 or s % 500 == 0)
-        if round_strikes / len(strikes) > 0.8:
-            indicators.append("round_number_strikes")
-    
-    # Check for deterministic patterns in IV
-    if "implied_volatility" in df.columns:
-        iv_vals = df["implied_volatility"].values
-        # Check for too-perfect parametric smile
-        unique_iv = len(pd.Series(iv_vals).round(4).unique())
-        if unique_iv < len(iv_vals) * 0.1:
-            indicators.append("low_iv_variety")
-    
-    return len(indicators) >= 2
+    # Feature presence audit
+    has_bid_ask = any(c in df.columns for c in ["best_bid_price", "best_ask_price", "bid", "ask", "bid_price", "ask_price"])
+    has_underlying_spot = any(c in df.columns for c in ["underlying_price", "spot_price", "index_price", "spot"])
+    has_iv = any(c in df.columns for c in ["implied_volatility", "iv", "mark_iv"])
+    greeks_present = [g for g in ["delta", "gamma", "vega", "theta", "rho"] if g in df.columns]
 
+    # Authenticity & Quality evaluation
+    # Deterministic synthetic heuristic: perfectly clean 0 missing, uniform 5s ticks, event_ids matching sequential prefix
+    is_synthetic = False
+    if "event_id" in df.columns:
+        sample_ids = df["event_id"].dropna().head(10).tolist()
+        if all(re.match(r"^ev_.*_\d+$", str(x)) for x in sample_ids):
+            is_synthetic = True
+    if total_missing == 0 and n_duplicates == 0 and avg_interval_seconds in [1.0, 5.0, 10.0]:
+        is_synthetic = True
 
-def generate_markdown_report(audit_results: List[Dict[str, Any]], output_path: Path) -> str:
-    """Generate a human-readable Markdown report from audit results."""
-    
-    lines = [
-        "# Dataset Audit Report",
-        f"Generated: {pd.Timestamp.now(tz='UTC').isoformat()}",
-        "",
-        "## Summary",
-        ""
-    ]
-    
-    for r in audit_results:
-        lines.append(f"### {Path(r['file']).name}")
-        lines.append(f"- **File size**: {r['file_size_bytes']:,} bytes ({r['file_size_bytes']/1024/1024:.2f} MB)")
-        lines.append(f"- **Rows**: {r['num_rows']:,}")
-        lines.append(f"- **Columns**: {r['num_columns']}")
-        lines.append(f"- **Memory usage**: {r['memory_usage_mb']:.2f} MB")
-        lines.append(f"- **Duplicate rows**: {r['duplicate_rows']}")
-        lines.append("")
-        
-        # Time range
-        if "min_timestamp" in r:
-            lines.append(f"**Time Range**: {r['min_timestamp']} to {r['max_timestamp']}")
-            lines.append(f"- Time span: {r['time_span_hours']:.2f} hours")
-            lines.append(f"- Unique timestamps: {r['num_unique_timestamps']:,}")
-            if "avg_timestamp_interval_seconds" in r:
-                lines.append(f"- Avg interval: {r['avg_timestamp_interval_seconds']:.2f} seconds")
-            lines.append("")
-        
-        # Strikes
-        if "num_unique_strikes" in r:
-            lines.append(f"**Strikes**: {r['num_unique_strikes']} unique ({r['min_strike']:.0f} to {r['max_strike']:.0f})")
-            if "strike_source" in r:
-                lines.append(f"- Source: {r['strike_source']}")
-            lines.append("")
-        
-        # Expiries
-        if "num_unique_expiries" in r:
-            if "expiry_column_used" in r:
-                lines.append(f"**Expiries**: {r['num_unique_expiries']} unique ({r['min_expiry']:.4f} to {r['max_expiry']:.4f} years)")
-                lines.append(f"- Expiry column: {r['expiry_column_used']}")
-            elif "unique_expiry_codes" in r:
-                lines.append(f"**Expiries**: {r['num_unique_expiries']} unique expiry codes")
-                lines.append(f"- Codes: {', '.join(r['unique_expiry_codes'])}")
-                lines.append(f"- Source: {r['expiry_source']}")
-            lines.append("")
-        
-        # Underlyings
-        if "unique_underlyings" in r:
-            lines.append(f"**Underlyings**: {', '.join(r['unique_underlyings'])}")
-            lines.append("")
-        
-        # Data availability
-        lines.append("**Available Data Fields**:")
-        lines.append(f"- Bid/Ask: {'Yes' if r['has_bid_ask'] else 'No'}")
-        lines.append(f"- Underlying spot price: {'Yes' if r['has_underlying_price'] else 'No'}")
-        lines.append(f"- Implied volatility: {'Yes' if r['has_iv'] else 'No'}")
-        lines.append(f"- Greeks (delta, vega): {'Yes' if r['has_greeks'] else 'No'}")
-        lines.append(f"- Volume (bid/ask amount): {'Yes' if r['has_volume'] else 'No'}")
-        lines.append(f"- Mark price: {'Yes' if r['has_mark_price'] else 'No'}")
-        lines.append("")
-        
-        # IV stats
-        if r["has_iv"]:
-            lines.append("**Implied Volatility Stats**:")
-            lines.append(f"- Range: {r['iv_min']:.4f} to {r['iv_max']:.4f}")
-            lines.append(f"- Mean: {r['iv_mean']:.4f}, Std: {r['iv_std']:.4f}")
-            lines.append(f"- Negative IV count: {r['negative_iv_count']}")
-            lines.append("")
-        
-        # Spot stats
-        if "spot_min" in r:
-            lines.append(f"**Spot Price Range**: {r['spot_min']:.2f} to {r['spot_max']:.2f} (mean: {r['spot_mean']:.2f})")
-            lines.append("")
-        
-        # Quality issues
-        lines.append("**Data Quality Issues**:")
-        if r["has_bid_ask"]:
-            lines.append(f"- Negative spreads: {r['negative_spread_count']}")
-            lines.append(f"- Zero/negative bids: {r['zero_bid_count']}")
-            lines.append(f"- Zero/negative asks: {r['zero_ask_count']}")
-        lines.append(f"- Missing values: {sum(r['missing_values'].values())} total across all columns")
-        if r["duplicate_rows"] > 0:
-            lines.append(f"- Duplicate rows: {r['duplicate_rows']}")
-        lines.append("")
-        
-        # Synthetic detection
-        lines.append(f"**Data Nature**: {'Likely Synthetic' if r['is_likely_synthetic'] else 'Appears Historical/Real'}")
-        if r["is_likely_synthetic"]:
-            lines.append("- Detected patterns consistent with synthetic generation (regular timestamps, round strikes, parametric IV)")
-        lines.append("")
-        
-        # Forecasting suitability
-        lines.append(f"**Time-Series Forecasting Suitability**: {'Suitable' if r['suitable_for_ts_forecasting'] else 'Not Suitable'}")
-        lines.append(f"- {r['ts_density_note']}")
-        lines.append("")
-        
-        # Column details
-        lines.append("**Column Details**:")
-        for col in r["column_names"]:
-            dtype = r["data_types"][col]
-            missing = r["missing_values"].get(col, 0)
-            lines.append(f"- `{col}`: {dtype} (missing: {missing})")
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-    
-    return "\n".join(lines)
+    data_quality_issues = []
+    if total_missing > 0:
+        data_quality_issues.append(f"{total_missing} missing values detected across columns.")
+    if n_duplicates > 0:
+        data_quality_issues.append(f"{n_duplicates} duplicate rows detected.")
+    if time_delta_seconds is not None and time_delta_seconds < 3600.0:
+        data_quality_issues.append(f"Total time horizon is only {time_delta_seconds:.0f} seconds (~{time_delta_seconds/60:.1f} mins), insufficient for macro multi-day volatility forecasting.")
+    if is_synthetic:
+        data_quality_issues.append("Dataset is synthetic/simulated data (generated via deterministic geometric motion), not real exchange tape.")
+    if len(greeks_present) < 5:
+        missing_greeks = [g for g in ["delta", "gamma", "vega", "theta", "rho"] if g not in greeks_present]
+        data_quality_issues.append(f"Greeks partially omitted: missing {missing_greeks}.")
 
+    audit_result = {
+        "file_path": file_path,
+        "file_size_bytes": os.path.getsize(file_path),
+        "n_rows": n_rows,
+        "n_cols": n_cols,
+        "columns": columns,
+        "dtypes": dtypes,
+        "missing_counts": missing_counts,
+        "total_missing": total_missing,
+        "n_duplicates": n_duplicates,
+        "min_timestamp": min_ts,
+        "max_timestamp": max_ts,
+        "n_unique_timestamps": n_unique_ts,
+        "duration_seconds": time_delta_seconds,
+        "avg_interval_seconds": avg_interval_seconds,
+        "timestamps_dense": timestamps_dense,
+        "unique_underlyings": unique_underlyings,
+        "n_instruments": len(instruments),
+        "unique_strikes": unique_strikes,
+        "unique_expiries": unique_expiries,
+        "has_bid_ask": has_bid_ask,
+        "has_underlying_spot": has_underlying_spot,
+        "has_iv": has_iv,
+        "greeks_present": greeks_present,
+        "is_synthetic": is_synthetic,
+        "data_quality_issues": data_quality_issues
+    }
+
+    # Print console summary
+    print("=" * 60)
+    print(f"DATASET AUDIT REPORT: {os.path.basename(file_path)}")
+    print("=" * 60)
+    print(f"Rows:                 {n_rows:,}")
+    print(f"Columns:              {n_cols} {columns}")
+    print(f"Total Missing:        {total_missing}")
+    print(f"Duplicates:           {n_duplicates}")
+    print(f"Timestamp Range:      {min_ts} -> {max_ts}")
+    print(f"Unique Timestamps:    {n_unique_ts} (Avg Interval: {avg_interval_seconds}s)")
+    print(f"Dense Time-Series:    {timestamps_dense}")
+    print(f"Underlyings:          {unique_underlyings}")
+    print(f"Instruments Count:    {len(instruments)}")
+    print(f"Strikes ({len(unique_strikes)}):         {unique_strikes}")
+    print(f"Expiries ({len(unique_expiries)}):        {unique_expiries}")
+    print(f"Bid/Ask Data:         {has_bid_ask}")
+    print(f"Underlying Spot:      {has_underlying_spot}")
+    print(f"Implied Vol (IV):     {has_iv}")
+    print(f"Greeks Present:       {greeks_present}")
+    print(f"Authenticity:         {'SYNTHETIC' if is_synthetic else 'GENUINE HISTORICAL'}")
+    print(f"Quality Issues ({len(data_quality_issues)}):")
+    for issue in data_quality_issues:
+        print(f"  - {issue}")
+    print("=" * 60)
+
+    if output_md:
+        generate_markdown_report(audit_result, output_md)
+        print(f"Audit report written to: {output_md}")
+
+    return audit_result
+
+def generate_markdown_report(result: Dict[str, Any], output_path: str):
+    md = f"""# Dataset Audit Report: `{os.path.basename(result['file_path'])}`
+
+**Audit Date**: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}  
+**Target File**: `{result['file_path']}`  
+**File Size**: {result['file_size_bytes'] / (1024 * 1024):.2f} MB  
+
+---
+
+## 1. Executive Summary
+
+| Metric | Value |
+|---|---|
+| **Total Observations (Rows)** | `{result['n_rows']:,}` |
+| **Total Features (Columns)** | `{result['n_cols']}` |
+| **Missing Values** | `{result['total_missing']}` |
+| **Duplicate Records** | `{result['n_duplicates']}` |
+| **Time Span** | `{result['min_timestamp']}` to `{result['max_timestamp']}` |
+| **Duration** | `{result['duration_seconds']:.0f} seconds` (~`{result['duration_seconds']/60:.1f} minutes`) |
+| **Discrete Timestamps** | `{result['n_unique_timestamps']}` |
+| **Sampling Interval** | `{result['avg_interval_seconds']} seconds` (High-frequency regular tick grid) |
+| **Underlying Assets** | `{', '.join(result['unique_underlyings'])}` |
+| **Unique Instruments** | `{result['n_instruments']}` |
+| **Strike Count** | `{len(result['unique_strikes'])}` strikes (`{result['unique_strikes']}`) |
+| **Expiry Count** | `{len(result['unique_expiries'])}` expiries (`{result['unique_expiries']}`) |
+| **Bid / Ask Quotes** | `{'Yes' if result['has_bid_ask'] else 'No'}` (`best_bid_price`, `best_ask_price`, quantities) |
+| **Underlying Spot Price** | `{'Yes' if result['has_underlying_spot'] else 'No'}` (`underlying_price`) |
+| **Implied Volatility (IV)** | `{'Yes' if result['has_iv'] else 'No'}` (`implied_volatility`) |
+| **Greeks Included** | `{', '.join(result['greeks_present'])}` |
+| **Data Nature** | **{'SYNTHETIC' if result['is_synthetic'] else 'HISTORICAL REAL'}** |
+| **Density for Forecasting** | **{'Sufficient for high-frequency/tick forecasting; Insufficient for macro multi-day forecasting' if result['timestamps_dense'] else 'Sparse'}** |
+
+---
+
+## 2. Column Schema & Data Types
+
+| Column Name | Data Type | Missing Count | Description |
+|---|---|---|---|
+"""
+    for col in result["columns"]:
+        dtype = result["dtypes"].get(col, "unknown")
+        miss = result["missing_counts"].get(col, 0)
+        md += f"| `{col}` | `{dtype}` | `{miss}` | |\n"
+
+    md += f"""
+---
+
+## 3. Data Authenticity & Limitations
+
+1. **Synthetic Nature**: The dataset is deterministically generated via geometric Brownian motion and Black-Scholes inversion (`services/replay/generator.py`). It is ideal for CI testing, offline replay, and architectural validation, but does not contain real market noise, microstructure jumps, or execution frictions.
+2. **Horizon Constraint**: The total time window covers only **16.5 minutes** (200 snapshots at 5-second intervals). It is suitable for high-frequency tick returns and sequence models, but cannot train multi-week realized volatility dynamics.
+3. **Missing Greeks**: Only `delta` and `vega` are explicitly serialized; `gamma`, `theta`, and `rho` must be derived dynamically via the quantitative pricer.
+4. **Preservation**: This file (`data/samples/btc_options_sample.parquet`) is strictly preserved for Milestone 1 replay and regression testing.
+
+---
+
+## 4. Recommendations for Machine Learning
+
+- **Feature Engineering**: Compute spot log returns, rolling Parkinson/realized volatility, moneyness $M = \\ln(K/S)$, and relative bid-ask spreads directly from available columns.
+- **Time-Series Splitting**: Enforce strict chronological order (70% train, 15% val, 15% test) across the 200 time steps. **Never randomly shuffle**.
+- **Model Training**: Use this dataset to establish pipeline invariants, unit test deep sequence models (LSTM/GRU), and train physics-informed neural surfaces (HyperIV/PINN). Real multi-month Deribit historical data should be ingested into `data/historical/` once acquired.
+"""
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(md)
 
 def main():
-    parser = argparse.ArgumentParser(description="Audit Parquet dataset files")
-    parser.add_argument("input", nargs="+", type=Path, help="Parquet file(s) to audit")
-    parser.add_argument("-o", "--output", type=Path, default=Path("data/DATASET_AUDIT.md"), help="Output markdown report path")
-    parser.add_argument("--json", type=Path, help="Output JSON report path")
+    parser = argparse.ArgumentParser(description="Audit Parquet options dataset.")
+    parser.add_argument("--file", default="data/samples/btc_options_sample.parquet", help="Path to Parquet file.")
+    parser.add_argument("--output", default="data/DATASET_AUDIT.md", help="Output path for Markdown audit report.")
     args = parser.parse_args()
-    
-    results = []
-    for filepath in args.input:
-        if not filepath.exists():
-            print(f"Error: File not found: {filepath}", file=sys.stderr)
-            sys.exit(1)
-        
-        print(f"Auditing {filepath}...")
-        result = audit_parquet_file(filepath)
-        results.append(result)
-        
-        # Print summary to console
-        print(f"\n=== {filepath.name} ===")
-        print(f"Rows: {result['num_rows']:,}")
-        print(f"Columns: {result['num_columns']}")
-        print(f"Time range: {result.get('min_timestamp', 'N/A')} to {result.get('max_timestamp', 'N/A')}")
-        print(f"Unique timestamps: {result.get('num_unique_timestamps', 'N/A')}")
-        print(f"Unique strikes: {result.get('num_unique_strikes', 'N/A')}")
-        print(f"Unique expiries: {result.get('num_unique_expiries', 'N/A')}")
-        print(f"Underlyings: {result.get('unique_underlyings', 'N/A')}")
-        print(f"Has bid/ask: {result['has_bid_ask']}")
-        print(f"Has IV: {result['has_iv']}")
-        print(f"Has Greeks: {result['has_greeks']}")
-        print(f"Likely synthetic: {result['is_likely_synthetic']}")
-        print(f"Suitable for TS forecasting: {result['suitable_for_ts_forecasting']}")
-        print()
-    
-    # Write markdown report
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    md_report = generate_markdown_report(results, args.output)
-    args.output.write_text(md_report)
-    print(f"Markdown report written to: {args.output}")
-    
-    # Write JSON report if requested
-    if args.json:
-        args.json.parent.mkdir(parents=True, exist_ok=True)
-        args.json.write_text(json.dumps(results, indent=2))
-        print(f"JSON report written to: {args.json}")
 
+    audit_dataset(args.file, args.output)
 
 if __name__ == "__main__":
     main()

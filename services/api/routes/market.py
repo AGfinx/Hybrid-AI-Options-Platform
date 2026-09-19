@@ -114,8 +114,9 @@ def get_volatility_surface(
     surf_data = surface.to_dict()
 
     # Record or update surface run in DB
+    import uuid
     run = SurfaceRun(
-        id=f"srun_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S')}",
+        id=f"srun_{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S%f')}_{uuid.uuid4().hex[:6]}",
         underlying=underlying,
         model_version_id=model_version,
         timestamp=now,
